@@ -118,6 +118,18 @@ library cql-io-lib
         , uuid               >= 1.2.6
         , vector             >= 0.10
 
+executable stressql
+  main-is: Main.hs
+  hs-source-dirs: stress
+  ghc-options: -threaded -eventlog
+  build-depends:
+    base
+    , async
+    , containers
+    , cql-io-lib
+    , random
+    , random-shuffle
+
 test-suite cql-io-tests
     type:               exitcode-stdio-1.0
     default-language:   Haskell2010

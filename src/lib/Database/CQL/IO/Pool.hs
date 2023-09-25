@@ -55,36 +55,44 @@ data PoolSettings = PoolSettings
     , _poolStripes    :: !Int
     }
 
-data Pool = Pool
-    { _createFn    :: !(IO Connection)
-    , _destroyFn   :: !(Connection -> IO ())
+type Pool = Pool_ Connection
+
+data Pool_ conn = Pool
+    { _createFn    :: !(IO conn)
+    , _destroyFn   :: !(conn -> IO ())
     , _logger      :: !Logger
     , _settings    :: !PoolSettings
     , _maxRefs     :: !Int
     , _currentTime :: !(IO UTCTime)
-    , _stripes     :: !(Vector Stripe)
+    , _stripes     :: !(Vector (Stripe_ conn))
     , _finaliser   :: !(IORef ())
     }
 
-data Resource = Resource
+type Resource = Resource_ Connection
+
+data Resource_ conn = Resource
     { tstamp   :: !UTCTime
     , refcnt   :: !Int
     , timeouts :: !Int
-    , value    :: !Connection
+    , value    :: !conn
     } deriving Show
 
-data Box
-    = New  !(IO Resource)
-    | Used !Resource
+type Box = Box_ Connection
+
+data Box_ conn
+    = New  !(IO (Resource_ conn))
+    | Used !(Resource_ conn)
     | Empty
 
-data Stripe = Stripe
-    { conns :: !(TVar (Seq Resource))
+type Stripe = Stripe_ Connection
+
+data Stripe_ conn = Stripe
+    { conns :: !(TVar (Seq (Resource_ conn)))
     , inUse :: !(TVar Int)
     }
 
 makeLenses ''PoolSettings
-makeLenses ''Pool
+makeLenses ''Pool_
 
 defSettings :: PoolSettings
 defSettings = PoolSettings
@@ -93,7 +101,7 @@ defSettings = PoolSettings
     16 -- max timeouts per connection
     4  -- max stripes
 
-create :: IO Connection -> (Connection -> IO ()) -> Logger -> PoolSettings -> Int -> IO Pool
+create :: (Show conn) => IO conn -> (conn -> IO ()) -> Logger -> PoolSettings -> Int -> IO (Pool_ conn)
 create mk del g s k = do
     p <- Pool mk del g s k
             <$> mkAutoUpdate defaultUpdateSettings { updateAction = getCurrentTime }
@@ -103,10 +111,10 @@ create mk del g s k = do
     void $ mkWeakIORef (p^.finaliser) (cancel r >> destroy p)
     return p
 
-destroy :: Pool -> IO ()
+destroy :: Pool_ conn -> IO ()
 destroy = purge
 
-with :: MonadIO m => Pool -> (Connection -> IO a) -> m (Maybe a)
+with :: (MonadIO m, Eq conn, Show conn) => Pool_ conn -> (conn -> IO a) -> m (Maybe a)
 with p f = liftIO $ do
     s <- stripe p
     mask $ \restore -> do
@@ -118,7 +126,7 @@ with p f = liftIO $ do
                 return (Just x)
             Nothing -> return Nothing
 
-purge :: Pool -> IO ()
+purge :: Pool_ conn -> IO ()
 purge p = Vec.forM_ (p^.stripes) $ \s -> do
     cs <- atomically (swapTVar (conns s) Seq.empty)
     mapM_ (ignore . view destroyFn p . value) cs
@@ -126,7 +134,7 @@ purge p = Vec.forM_ (p^.stripes) $ \s -> do
 -----------------------------------------------------------------------------
 -- Internal
 
-cleanup :: Pool -> Stripe -> Resource -> SomeException -> IO a
+cleanup :: (Show conn, Eq conn) => Pool_ conn -> Stripe_ conn -> Resource_ conn -> SomeException -> IO a
 cleanup p s r x = do
     case fromException x of
         Just (ResponseTimeout {}) -> onTimeout
@@ -140,7 +148,7 @@ cleanup p s r x = do
                 destroyR p s r
             else put p s r incrTimeouts
 
-take1 :: Pool -> Stripe -> IO (Maybe Resource)
+take1 :: Pool_ conn -> Stripe_ conn -> IO (Maybe (Resource_ conn))
 take1 p s = do
     r <- atomically $ do
         c <- readTVar (conns s)
@@ -153,6 +161,7 @@ take1 p s = do
                 mkNew p
            | n > 0 && refcnt r < p^.maxRefs -> use s r rr
            | otherwise                      -> return Empty
+    -- ASYNC KILL
     case r of
         New io -> do
             x <- io `onException` atomically (modifyTVar' (inUse s) (subtract 1))
@@ -161,17 +170,17 @@ take1 p s = do
         Used x -> return (Just x)
         Empty  -> return Nothing
 
-use :: Stripe -> Resource -> Seq Resource -> STM Box
+use :: Stripe_ conn -> Resource_ conn -> Seq (Resource_ conn) -> STM (Box_ conn)
 use s r rr = do
     writeTVar (conns s) $! rr |> r { refcnt = refcnt r + 1 }
     return (Used r)
 {-# INLINE use #-}
 
-mkNew :: Pool -> STM Box
+mkNew :: Pool_ conn -> STM (Box_ conn)
 mkNew p = return (New $ Resource <$> p^.currentTime <*> pure 1 <*> pure 0 <*> p^.createFn)
 {-# INLINE mkNew #-}
 
-put :: Pool -> Stripe -> Resource -> (Resource -> Resource) -> IO ()
+put :: (Eq conn) => Pool_ conn -> Stripe_ conn -> Resource_ conn -> (Resource_ conn -> Resource_ conn) -> IO ()
 put p s r f = do
     now <- p^.currentTime
     let updated x = f x { tstamp = now, refcnt = refcnt x - 1 }
@@ -182,7 +191,7 @@ put p s r f = do
             EmptyL  -> writeTVar (conns s) $! xs         |> updated r
             y :< ys -> writeTVar (conns s) $! (xs >< ys) |> updated y
 
-destroyR :: Pool -> Stripe -> Resource -> IO ()
+destroyR :: (Eq conn) => Pool_ conn -> Stripe_ conn -> Resource_ conn -> IO ()
 destroyR p s r = do
     atomically $ do
         rs <- readTVar (conns s)
@@ -193,7 +202,7 @@ destroyR p s r = do
                 writeTVar (conns s) $! Seq.filter ((value r /=) . value) rs
     ignore $ p^.destroyFn $ value r
 
-reaper :: Pool -> IO ()
+reaper :: (Show conn) => Pool_ conn -> IO ()
 reaper p = forever $ do
     threadDelay 1000000
     now <- p^.currentTime
@@ -209,10 +218,10 @@ reaper p = forever $ do
             logDebug (p^.logger) $ "Reaping idle connection: " <> string8 (show (value v))
             p^.destroyFn $ (value v)
 
-stripe :: Pool -> IO Stripe
+stripe :: Pool_ conn -> IO (Stripe_ conn)
 stripe p = ((p^.stripes) !) <$> ((`mod` (p^.settings.poolStripes)) . hash) <$> myThreadId
 {-# INLINE stripe #-}
 
-incrTimeouts :: Resource -> Resource
+incrTimeouts :: Resource_ conn -> Resource_ conn
 incrTimeouts r = r { timeouts = timeouts r + 1 }
 {-# INLINE incrTimeouts #-}
