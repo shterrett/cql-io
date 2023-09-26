@@ -179,7 +179,7 @@ put p s r f = do
         rs <- readTVar (conns s)
         let (xs, rr) = Seq.breakl ((value r ==) . value) rs
         case Seq.viewl rr of
-            EmptyL  -> writeTVar (conns s) $! xs         |> updated r
+            EmptyL  -> pure ()
             y :< ys -> writeTVar (conns s) $! (xs >< ys) |> updated y
 
 destroyR :: Pool -> Stripe -> Resource -> IO ()
