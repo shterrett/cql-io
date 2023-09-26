@@ -111,12 +111,13 @@ with p f = liftIO $ do
     s <- stripe p
     mask $ \restore -> do
         r <- take1 p s
-        case r of
+        r' <- case r of
             Just  v -> do
                 x <- restore (f (value v)) `catch` cleanup p s v
                 put p s v id
                 return (Just x)
             Nothing -> return Nothing
+        yield *> pure r'
 
 purge :: Pool -> IO ()
 purge p = Vec.forM_ (p^.stripes) $ \s -> do
